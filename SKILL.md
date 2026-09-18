@@ -1,8 +1,10 @@
 ---
 name: gha-runner
 slug: gha-runner
-version: 1.0.0
+version: 1.0.1
 displayName: GHA Runner · 云端任务 Worker
+homepage: https://github.com/2001261/gha-runner
+tags: [GitHub Actions, 云端执行, CI, 任务卸载, 并行跑批, agent]
 description: >-
   把任务委派到 GitHub Actions 云端沙盒化执行、取回结构化结果的调度器（批处理，非交互式
   云电脑）。能力：判定任务适合性、空白环境自举 gh、投递执行、异步轮询、artifact 取回

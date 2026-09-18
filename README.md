@@ -32,7 +32,7 @@
 环境要求：**Python ≥ 3.9**（纯标准库，零依赖）+ **gh CLI**（没有的话 `setup` 会引导安装）。
 
 ```bash
-git clone <本仓库地址> && cd gha-runner
+git clone https://github.com/2001261/gha-runner.git && cd gha-runner
 
 # 0. 环境自检（只读，随时可跑）
 ./gha doctor                    # Windows 用 gha.cmd

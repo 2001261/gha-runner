@@ -1,0 +1,523 @@
+name: agent-dispatch
+
+# 这个文件必须待在仓库的【默认分支】上，workflow_dispatch 才触发得了。
+# 触发时可以用 --ref 指定跑其它分支的版本（大 payload 走分支投递时就是这么用的）。
+run-name: ${{ inputs.task_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: "任务标识，只允许 [A-Za-z0-9._-]，用于 artifact 命名与本地结果目录"
+        type: string
+        required: true
+      payload_b64:
+        description: "任务目录 tar.gz 的 base64；为空则从 ref 分支的 task_path 读取"
+        type: string
+        default: ""
+      task_path:
+        description: "payload_b64 为空时，仓库内任务目录路径，如 tasks/<task_id>"
+        type: string
+        default: ""
+      runner:
+        description: "runner 标签。公开仓库 ubuntu-latest = 4vCPU/16GB，私有仓库只有 2vCPU/8GB"
+        type: choice
+        options: [ubuntu-latest, ubuntu-24.04, ubuntu-22.04, macos-latest, windows-latest]
+        default: ubuntu-latest
+      shell:
+        description: "任务入口解释器；auto = 按找到的入口文件名推断"
+        type: choice
+        options: [auto, bash, python3, node]
+        default: auto
+      timeout_minutes:
+        description: "job 超时分钟数，GitHub 硬上限 360（6 小时）"
+        type: string
+        default: "360"
+      cache_key:
+        description: "跨 run 状态缓存键（[A-Za-z0-9._-]）；非空时用 actions/cache 复用 ~/.gha-state，存唯一键 <key>-<run_id>、按前缀恢复最近一次"
+        type: string
+        default: ""
+      cache_paths:
+        description: "额外要缓存的路径，逗号或换行分隔；~/.gha-state 与已存在的常见工具缓存目录始终包含"
+        type: string
+        default: ""
+
+# 最小权限：只需要 checkout 读代码。推分支由本地 git 完成，不需要 contents:write。
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    # timeout_minutes 是 string 类型的 input，表达式里要 fromJSON 转数字。
+    # CLI 侧已校验范围；这里的 || '360' 兜住 input 缺失的情况。
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || '360') }}
+    steps:
+      # 所有 input 一律通过 env 传进脚本，绝不把 ${{ inputs.x }} 直接插值到 run: 里 ——
+      # 后者是 GitHub 明确警告的脚本注入向量（input 内容会被当成 shell 代码执行）。
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prepare task
+        id: prepare
+        env:
+          IN_PAYLOAD_B64: ${{ inputs.payload_b64 }}
+          IN_TASK_PATH: ${{ inputs.task_path }}
+          IN_SHELL: ${{ inputs.shell }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          WORK="$RUNNER_TEMP/gha-task"
+          RES="$RUNNER_TEMP/gha-result"
+          BUNDLE="$RUNNER_TEMP/gha-bundle.tgz"
+          rm -rf "$WORK" "$RES" "$BUNDLE"
+          mkdir -p "$WORK" "$RES/output"
+          {
+            echo "GHA_WORK=$WORK"
+            echo "GHA_RES=$RES"
+            echo "GHA_TASK_DIR=$WORK"
+            echo "GHA_OUTPUT_DIR=$RES/output"
+            echo "GHA_STARTED=$(date -u +%s)"
+          } >> "$GITHUB_ENV"
+
+          if [ -n "$IN_PAYLOAD_B64" ]; then
+            echo "::group::解码内联 payload（${#IN_PAYLOAD_B64} 字符 base64）"
+            printf '%s' "$IN_PAYLOAD_B64" | base64 -d > "$BUNDLE" || { echo "::error::base64 解码失败"; exit 1; }
+            # Windows 的 GNU tar 会把 "D:\..." 的盘符当成远程主机名（host:path 语法），
+            # 报 "Cannot connect to D: resolve failed"。进到目录里用相对路径解包，绕开盘符。
+            ( cd "$RUNNER_TEMP" && tar xzf gha-bundle.tgz -C gha-task ) || { echo "::error::tar 解包失败"; exit 1; }
+            echo "任务来源：内联 payload_b64"
+            echo "::endgroup::"
+          elif [ -n "$IN_TASK_PATH" ]; then
+            echo "::group::从 ref 分支读取任务目录：$IN_TASK_PATH"
+            if [ ! -d "$IN_TASK_PATH" ]; then echo "::error::task_path 不存在: $IN_TASK_PATH"; exit 1; fi
+            # cp -R 而不是软链，保证任务目录是独立副本
+            cp -R "$IN_TASK_PATH/." "$WORK/" || { echo "::error::复制任务目录失败"; exit 1; }
+            echo "任务来源：分支内 $IN_TASK_PATH"
+            echo "::endgroup::"
+          else
+            echo "::error::payload_b64 与 task_path 都为空，没有任务可跑"
+            exit 1
+          fi
+
+          # 找入口。注意用 if 而不是 `[ ... ] && x=...`：
+          # 后者在测试为假时返回非零，会被 set -e / 步骤失败判定误伤。
+          entry=""
+          case "$IN_SHELL" in
+            bash)    if [ -f "$WORK/task.sh" ]; then entry=task.sh; fi ;;
+            python3) if [ -f "$WORK/task.py" ]; then entry=task.py; fi ;;
+            node)    if [ -f "$WORK/task.js" ]; then entry=task.js; fi ;;
+          esac
+          if [ -z "$entry" ]; then
+            for c in task.sh task.py task.js; do
+              if [ -f "$WORK/$c" ]; then entry=$c; break; fi
+            done
+          fi
+          if [ -z "$entry" ]; then
+            echo "::error::任务目录里没有 task.sh / task.py / task.js"
+            ls -la "$WORK"
+            exit 1
+          fi
+          case "$entry" in
+            task.py) kind=python3 ;;
+            task.js) kind=node ;;
+            *)       kind=bash ;;
+          esac
+          chmod +x "$WORK/$entry" 2>/dev/null || true
+
+          # python 入口的解释器名因平台而异：windows-latest 上只有 python 没有 python3。
+          # 在 Prepare 阶段探测好，Run task 直接用 $GHA_PYBIN，不在执行时才碰运气。
+          pybin=""
+          if [ "$kind" = "python3" ]; then
+            if command -v python3 >/dev/null 2>&1; then pybin=python3;
+            elif command -v python >/dev/null 2>&1; then pybin=python; fi
+            if [ -z "$pybin" ]; then echo "::error::任务需要 python，但 runner 上 python3/python 都没有"; exit 1; fi
+          fi
+
+          {
+            echo "GHA_ENTRY=$entry"
+            echo "GHA_SHELL_KIND=$kind"
+            echo "GHA_PYBIN=$pybin"
+          } >> "$GITHUB_ENV"
+          echo "入口=$entry  解释器=$kind"
+          echo "任务目录内容："
+          ( cd "$WORK" && find . -maxdepth 2 -print )
+
+      # 状态目录：任务跨 run 复用的家。不论缓存开没开都建出来并写进 GHA_STATE_DIR，
+      # 让任务脚本始终可以用 "$GHA_STATE_DIR" 而不必判断。
+      - name: Prepare state
+        id: pstate
+        env:
+          IN_CACHE_PATHS: ${{ inputs.cache_paths }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          STATE_DIR="$HOME/.gha-state"
+          mkdir -p "$STATE_DIR"
+          echo "GHA_STATE_DIR=$STATE_DIR" >> "$GITHUB_ENV"
+          echo "state_dir=$STATE_DIR" >> "$GITHUB_OUTPUT"
+
+          # 汇总进缓存的路径：状态目录 + 已存在的常见工具缓存 + 用户额外指定。
+          # 只放真实存在的路径，不存在的会让 cache 步骤白 warn 一次。
+          # 这个列表必须与 gha_runner/core.py 的 DEFAULT_CACHE_SUBDIRS 保持一致。
+          {
+            echo "paths<<EOF_PATHS"
+            echo "$STATE_DIR"
+            for sub in .cache/pip .npm .cache/uv .cargo/registry .cache/go-build .m2 .gradle/caches .cache/yarn; do
+              if [ -d "$HOME/$sub" ]; then echo "$HOME/$sub"; fi
+            done
+            printf '%s' "$IN_CACHE_PATHS" | tr ',;' '\n\n' | while IFS= read -r p; do
+              p=$(printf '%s' "$p" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+              if [ -n "$p" ]; then echo "$p"; fi
+            done
+            echo "EOF_PATHS"
+          } >> "$GITHUB_OUTPUT"
+          echo "state 目录：$STATE_DIR"
+
+      # 存唯一键 <key>-<run_id>、按前缀 <key>- 恢复最近一次 ——
+      # actions/cache/save 撞已存在的 key 会直接失败（"Cache already exists"），
+      # 这是官方推荐解法；旧条目靠 7 天过期 + 仓库 10GB LRU 自动回收。
+      - name: Restore state
+        if: inputs.cache_key != ''
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.pstate.outputs.paths }}
+          key: ${{ inputs.cache_key }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ inputs.cache_key }}-
+
+      - name: Run task
+        id: task
+        shell: bash
+        run: |
+          # 关键：声明了 shell: bash 后，GitHub 是用 `bash --noprofile --norc -e -o pipefail`
+          # 调用本脚本的 —— -e 已经开着。必须显式 set +e，否则任务一非零退出，
+          # 下面的 code=$? / 写 exit_code / cat 日志全都不会执行，manifest 只能拿到 -1。
+          set +e
+          set -u
+          RES="$GHA_RES"
+          : > "$RES/stdout.log"
+          : > "$RES/stderr.log"
+
+          # 后台 tail 把 stdout 实时打到 Actions 日志，让 `gh run watch` 有东西可看。
+          # 完整性不依赖它 —— 结束时还会整体 cat 一遍写进 artifact。
+          tailpid=""
+          if command -v tail >/dev/null 2>&1; then
+            tail -n +1 -F "$RES/stdout.log" >/dev/stdout 2>/dev/null &
+            tailpid=$!
+          fi
+
+          interp=""
+          case "$GHA_SHELL_KIND" in
+            python3) interp="$GHA_PYBIN" ;;   # Prepare task 已按平台探测好（windows 上是 python）
+            node)    interp="node" ;;
+          esac
+
+          echo "=== 任务开始 $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+          # Windows runner 的 python 默认 stdout 是 cp1252，任务 print 中文会直接崩。
+          # 统一强制 UTF-8：Linux/macOS 本来就是 UTF-8，无副作用；Windows 上救任务一命。
+          export PYTHONIOENCODING=utf-8
+          (
+            cd "$GHA_TASK_DIR" || exit 127
+            if [ -n "$interp" ]; then
+              "$interp" "./$GHA_ENTRY"
+            else
+              bash "./$GHA_ENTRY"
+            fi
+          ) >> "$RES/stdout.log" 2>> "$RES/stderr.log"
+          code=$?
+
+          if [ -n "$tailpid" ]; then
+            sleep 1
+            kill "$tailpid" 2>/dev/null || true
+            wait "$tailpid" 2>/dev/null || true
+          fi
+          echo "$code" > "$RES/exit_code"
+          echo "=== 任务结束 $(date -u +%Y-%m-%dT%H:%M:%SZ)，exit_code=$code ==="
+
+          echo "::group::stdout（$(wc -c < "$RES/stdout.log" | tr -d ' ') 字节）"
+          cat "$RES/stdout.log"
+          echo "::endgroup::"
+          echo "::group::stderr（$(wc -c < "$RES/stderr.log" | tr -d ' ') 字节）"
+          cat "$RES/stderr.log"
+          echo "::endgroup::"
+
+          if [ "$code" -ne 0 ]; then
+            echo "::error::任务以 exit_code=$code 结束（结果仍会打包进 artifact）"
+            echo "GHA_TASK_OK=false" >> "$GITHUB_ENV"
+          else
+            echo "GHA_TASK_OK=true" >> "$GITHUB_ENV"
+          fi
+          # 如实以任务的退出码结束本步骤 —— run 的 conclusion 要反映真实结果，
+          # 否则失败任务在 run 列表里显示成 success，agent 会误判。
+          # 结果不丢：manifest / summary / upload 三步都挂了 if: always()。
+          exit "$code"
+
+      - name: Build manifest
+        id: manifest
+        if: always()
+        env:
+          IN_TASK_ID: ${{ inputs.task_id }}
+          IN_RUNNER: ${{ inputs.runner }}
+          IN_CACHE_KEY: ${{ inputs.cache_key }}
+          IN_CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+          IN_RESTORED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+          IN_CACHED_PATHS: ${{ steps.pstate.outputs.paths }}
+        shell: bash
+        run: |
+          # 同 Run task：shell: bash 会带上 -e，这里是 if: always() 的兜底步骤，
+          # 绝不能因为某条命令非零就中止，否则连 manifest 都产不出来。
+          set +e
+          set -u
+          RES="$GHA_RES"
+          mkdir -p "$RES"
+          if [ ! -f "$RES/exit_code" ]; then
+            # 走到这里说明 Run task 没能写下退出码 —— 通常是 job 被强制终止（超时/取消）
+            echo "-1" > "$RES/exit_code"
+            export GHA_EXIT_CODE_MISSING=true
+            echo "GHA_EXIT_CODE_MISSING=true" >> "$GITHUB_ENV"
+          fi
+          if [ ! -f "$RES/stdout.log" ]; then : > "$RES/stdout.log"; fi
+          if [ ! -f "$RES/stderr.log" ]; then : > "$RES/stderr.log"; fi
+          # GITHUB_ENV 只对后续步骤可见，本步骤自己要用的话必须同时 export
+          GHA_FINISHED=$(date -u +%s)
+          export GHA_FINISHED
+          echo "GHA_FINISHED=$GHA_FINISHED" >> "$GITHUB_ENV"
+
+          # JSON 用 python 组装：stdout_tail/stderr_tail 是任意文本，
+          # 手工拼 JSON 处理不好引号、换行和控制字符。
+          # windows-latest 上预装的解释器只有 python 没有 python3，两个都试。
+          PYBIN=""
+          if command -v python3 >/dev/null 2>&1; then PYBIN=python3;
+          elif command -v python >/dev/null 2>&1; then PYBIN=python; fi
+          if [ -n "$PYBIN" ]; then
+            "$PYBIN" - <<'PY'
+          import json, os, platform, shutil, subprocess, sys
+
+          # Windows runner 的 stdout 默认是 cp1252，print 中文直接 UnicodeEncodeError。
+          # 重配成 utf-8 + replace，打印崩了也不能带走整个 manifest 步骤。
+          try:
+              sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+          except Exception:
+              pass
+
+          res = os.environ["GHA_RES"]
+
+          def read(p):
+              try:
+                  with open(p, "rb") as f:
+                      return f.read()
+              except OSError:
+                  return b""
+
+          def tail(b, n=4000):
+              return b[-n:].decode("utf-8", "replace")
+
+          def sh(cmd):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+                  return r.stdout.strip()
+              except Exception:
+                  return ""
+
+          so, se = read(res + "/stdout.log"), read(res + "/stderr.log")
+          try:
+              code = int(read(res + "/exit_code").strip() or -1)
+          except ValueError:
+              code = -1
+
+          cores = 0
+          for c in ("nproc", "sysctl -n hw.ncpu"):
+              v = sh(c)
+              if v.isdigit():
+                  cores = int(v)
+                  break
+          if not cores:
+              # Windows 兜底：nproc/sysctl 都不存在时用 python 自己数
+              cores = os.cpu_count() or 0
+
+          mem_mb = 0
+          m = sh("awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo")
+          if not m.isdigit():
+              m = sh("sysctl -n hw.memsize")
+              if m.isdigit():
+                  m = str(int(m) // (1024 * 1024))
+          if m.isdigit():
+              mem_mb = int(m)
+          if not mem_mb:
+              # Windows 兜底：/proc 与 sysctl 都没有，走 PowerShell CIM
+              v = sh('powershell -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize"')
+              if v.isdigit():
+                  mem_mb = int(v) // 1024
+
+          try:
+              disk_gb = shutil.disk_usage(os.getcwd()).free // (1024 ** 3)
+          except Exception:
+              disk_gb = 0
+
+          # output/_outputs.env 里的 KEY=value 折进 outputs，
+          # 给 agent 一批不用解析文件就能读的小标量结果
+          outputs = {}
+          for line in tail(read(res + "/output/_outputs.env"), 65536).splitlines():
+              line = line.strip()
+              if not line or line.startswith("#") or "=" not in line:
+                  continue
+              k, v = line.split("=", 1)
+              outputs[k.strip()] = v.strip()
+
+          started = int(os.environ.get("GHA_STARTED", "0") or 0)
+          finished = int(os.environ.get("GHA_FINISHED", "0") or 0)
+          task_id = os.environ.get("IN_TASK_ID", "")
+
+          cache_key = os.environ.get("IN_CACHE_KEY", "")
+          state_dir = os.environ.get("GHA_STATE_DIR", "")
+          state_bytes = 0
+          if cache_key and state_dir and os.path.isdir(state_dir):
+              for root, _dirs, files in os.walk(state_dir):
+                  for fn in files:
+                      try:
+                          state_bytes += os.path.getsize(os.path.join(root, fn))
+                      except OSError:
+                          pass
+          cached_paths = [p for p in os.environ.get("IN_CACHED_PATHS", "").splitlines() if p.strip()]
+
+          out_files = []
+          odir = res + "/output"
+          for root, _dirs, files in os.walk(odir):
+              for fn in sorted(files):
+                  fp = os.path.join(root, fn)
+                  try:
+                      sz = os.path.getsize(fp)
+                  except OSError:
+                      sz = -1
+                  out_files.append({"path": os.path.relpath(fp, odir), "bytes": sz})
+
+          manifest = {
+              "schema": 2,
+              "task_id": task_id,
+              # 注意：status / conclusion / run_id / run_url 不在这里 ——
+              # runner 跑的时候 run 还没结束，写不出终态。那些字段在同目录的
+              # run.json 里，由本地 `gha fetch` 从 API 取。artifact 内容保持只读不改。
+              "exit_code": code,
+              # code == -1 且 recorded 为 false，说明 Run task 步骤被强制终止
+              # （超时 / 取消），任务真实退出码无从记录
+              "exit_code_recorded": os.environ.get("GHA_EXIT_CODE_MISSING") != "true",
+              "task_ok": (os.environ.get("GHA_TASK_OK") == "true") and code == 0,
+              "runner": os.environ.get("IN_RUNNER", ""),
+              "runner_os": os.environ.get("RUNNER_OS", ""),
+              "shell": os.environ.get("GHA_SHELL_KIND", ""),
+              "entry": os.environ.get("GHA_ENTRY", ""),
+              "job_started_at": started,
+              "job_finished_at": finished,
+              "duration_s": (finished - started) if started and finished else 0,
+              "runner_env": {
+                  "cores": cores,
+                  "mem_total_mb": mem_mb,
+                  "disk_free_gb": disk_gb,
+                  "python": platform.python_version(),
+                  "os": platform.system() + " " + platform.release(),
+              },
+              "outputs": outputs,
+              "output_files": out_files,
+              # 状态复用小节（schema 2 新增）：本地 describe_state() 按这些字段渲染
+              # 注意 cache_hit 的判定：我们存的是唯一键 <key>-<run_id>，restore 的
+              # cache-hit 只在精确命中时为 true，前缀命中时永远是 false ——
+              # 所以真正的"恢复到状态了没有"要看 cache-matched-key 是否非空。
+              "state": {
+                  "cache_key": cache_key,
+                  "cache_hit": (os.environ.get("IN_CACHE_HIT", "") == "true"
+                                or bool(os.environ.get("IN_RESTORED_KEY", ""))),
+                  "restored_key": os.environ.get("IN_RESTORED_KEY", ""),
+                  "state_dir": state_dir,
+                  "state_dir_bytes": state_bytes,
+                  "cached_paths": cached_paths,
+              },
+              "artifacts": ["result-" + task_id] if task_id else [],
+              "stdout_bytes": len(so),
+              "stderr_bytes": len(se),
+              "stdout_tail": tail(so),
+              "stderr_tail": tail(se),
+          }
+          with open(res + "/manifest.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False, indent=2)
+              f.write("\n")
+          print("manifest.json 已生成：exit_code=%s outputs=%d output_files=%d"
+                % (code, len(outputs), len(out_files)))
+          PY
+          else
+            # 没有 python3 的极端情况：退化成不含 tail 的最小 manifest，仍是合法 JSON
+            code=$(cat "$RES/exit_code" 2>/dev/null || echo "-1")
+            printf '{"schema":1,"task_id":"%s","exit_code":%s,"stdout_bytes":%s,"stderr_bytes":%s,"note":"runner 无 python3，manifest 为最小版本"}\n' \
+              "$IN_TASK_ID" "$code" \
+              "$(wc -c < "$RES/stdout.log" | tr -d ' ')" \
+              "$(wc -c < "$RES/stderr.log" | tr -d ' ')" > "$RES/manifest.json"
+            echo "::warning::runner 上没有 python3，manifest.json 是最小版本"
+          fi
+
+      # always()：任务失败 / 被强杀时状态同样值得留下（续跑正依赖它）。
+      # continue-on-error：缓存保存失败（体积超限、服务抖动）不该拖垮整个 run。
+      - name: Save state
+        if: always() && inputs.cache_key != ''
+        id: save
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.pstate.outputs.paths }}
+          key: ${{ inputs.cache_key }}-${{ github.run_id }}
+
+      - name: Job summary
+        id: summary
+        if: always()
+        env:
+          IN_TASK_ID: ${{ inputs.task_id }}
+          IN_RUNNER: ${{ inputs.runner }}
+        shell: bash
+        run: |
+          set +e   # 同前：if: always() 的兜底步骤不能被 -e 中止
+          set -u
+          RES="$GHA_RES"
+          code=$(cat "$RES/exit_code" 2>/dev/null || echo "?")
+          # GITHUB_STEP_SUMMARY 单 step 上限 1 MiB：只放摘要，不放全量日志
+          {
+            echo "## 任务 \`${IN_TASK_ID}\`"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| exit_code | \`${code}\` |"
+            echo "| 入口 | \`${GHA_ENTRY:-?}\`（\`${GHA_SHELL_KIND:-?}\`） |"
+            echo "| runner | \`${IN_RUNNER}\` / \`${RUNNER_OS:-?}\` |"
+            echo "| stdout | $(wc -c < "$RES/stdout.log" 2>/dev/null | tr -d ' ') 字节 |"
+            echo "| stderr | $(wc -c < "$RES/stderr.log" 2>/dev/null | tr -d ' ') 字节 |"
+            if [ -d "$RES/output" ]; then
+              echo
+              echo "### output/ 产物"
+              ( cd "$RES/output" && find . -type f -print | sed 's|^\./|- |' )
+            fi
+            echo
+            echo "### stdout 末尾"
+            echo '```'
+            tail -c 3000 "$RES/stdout.log" 2>/dev/null || true
+            echo '```'
+            if [ -s "$RES/stderr.log" ]; then
+              echo
+              echo "### stderr 末尾"
+              echo '```'
+              tail -c 2000 "$RES/stderr.log" 2>/dev/null || true
+              echo '```'
+            fi
+          } > "$GITHUB_STEP_SUMMARY"
+          echo "job summary 已写入"
+
+      # if: always() 是关键 —— 任务失败时更要上传，否则 agent 拿不到失败原因。
+      - name: Upload result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ inputs.task_id }}
+          path: ${{ runner.temp }}/gha-result/
+          retention-days: 7
+          # warn 而不是 error：万一 result/ 是空的，也不该把"没结果"变成新的失败
+          if-no-files-found: warn

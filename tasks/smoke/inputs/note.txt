@@ -1,0 +1,2 @@
+这个文件只为验证 inputs/ 目录能正确打包并在 runner 侧出现。
+任务脚本会 find inputs/ 并打印它。

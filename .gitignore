@@ -1,0 +1,15 @@
+# setup 在空白环境下载的 gh 兜底副本（38MB，机器级缓存，不入库）
+bin/*
+!bin/.gitkeep
+
+# 运行时配置：含仓库 slug 与可见性
+config/repo
+config/visibility
+
+# 本地 run 状态与取回的结果（artifact 内容可能含敏感产物）
+.gha-runs/
+
+# 任务包里的临时产物
+**/output/
+**/*.tgz
+**/.DS_Store

@@ -1,0 +1,22 @@
+#!/bin/sh
+# gha — gha-runner 启动器（POSIX sh）。Windows 用同目录的 gha.cmd。
+#
+# 用 python -c 注入 sys.path 而不是设 PYTHONPATH：
+# 这样不会覆盖用户已有的 PYTHONPATH，也绕开了 Windows/Git Bash 下
+# PATH 分隔符到底是 ':' 还是 ';' 的麻烦。
+
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+
+BOOTSTRAP='import sys; sys.path.insert(0, sys.argv[1]); from gha_runner.cli import main; sys.exit(main(sys.argv[2:]))'
+
+for p in python3 python; do
+  if command -v "$p" >/dev/null 2>&1; then
+    exec "$p" -c "$BOOTSTRAP" "$dir" "$@"
+  fi
+done
+
+echo "gha: 需要 Python >= 3.9，但 PATH 里找不到 python3 或 python" >&2
+echo "     macOS   : xcode-select --install   或   brew install python3" >&2
+echo "     Debian  : sudo apt install python3" >&2
+echo "     Windows : 用 gha.cmd，或 winget install Python.Python.3.12" >&2
+exit 1

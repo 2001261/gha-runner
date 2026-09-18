@@ -1,5 +1,8 @@
 ---
 name: gha-runner
+slug: gha-runner
+version: 1.0.0
+displayName: GHA Runner · 云端任务 Worker
 description: >-
   把任务委派到 GitHub Actions 云端沙盒化执行、取回结构化结果的调度器（批处理，非交互式
   云电脑）。能力：判定任务适合性、空白环境自举 gh、投递执行、异步轮询、artifact 取回

@@ -10,7 +10,7 @@ import json
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import bundle, core, remote, secrets, setupenv, state, ui
 from .ui import (EXIT_FAIL, EXIT_NOT_AUTHORIZED, EXIT_OK, EXIT_SECRET_FOUND,
@@ -166,6 +166,7 @@ def cmd_init(args) -> int:
     sa.allow_public = False
     sa.cache_key = ""
     sa.cache_paths = ""
+    sa.cleanup = False
     sa.yes = True
     sa.force = False
     rc = cmd_submit(sa)
@@ -330,6 +331,16 @@ def cmd_submit(args) -> int:
     byrun.mkdir(parents=True, exist_ok=True)
     core.write_text_file(byrun / "task_id", task_id)
 
+    # --- --cleanup（B 类，需 --yes）：结果取回成功后自动清理该 run + artifact
+    #     非 --wait 时把意图落进 .gha-runs/<task_id>/cleanup，之后 fetch 读到就生效；
+    #     取回失败绝不清理 —— 要保留现场证据。
+    if args.cleanup and not authorized:
+        ui.st_install("自动清理未启用（--cleanup 是 B 类写操作，需要与 --yes 一起用）")
+        ui.note(f"取回成功后可手动清理: ./gha clean --run-id {rid} --yes")
+    elif args.cleanup and not args.wait:
+        core.run_set(task_id, "cleanup", "1", args.out)
+        ui.note("已登记 --cleanup：取回（fetch）成功后自动清理该 run 与 artifact")
+
     ui.st_ok(f"已提交：run_id={rid}")
     ui.log(f"    https://github.com/{repo}/actions/runs/{rid}")
     ui.note(f"查询: ./gha status {task_id}")
@@ -340,9 +351,16 @@ def cmd_submit(args) -> int:
         ui.log("")
         wrc = _wait(rid, repo, args.wait_timeout, args.interval)
         try:
-            _fetch(rid, repo, args.out, force=False, authorized=True)
+            frc = _fetch(rid, repo, args.out, force=False, authorized=True,
+                         cleanup=False)
         except GhaError as e:
             ui.warn(f"取回结果失败：{e.message}")
+            return wrc
+        if args.cleanup and frc == EXIT_OK:
+            ui.info(f"取回成功，按 --cleanup 清理 run {rid} 与 artifact")
+            _delete_run_contents(repo, rid)
+        elif args.cleanup:
+            ui.warn("取回未成功（退出码非 0），不做清理 —— 保留 run 与 artifact 供排查")
         return wrc
     return EXIT_OK
 
@@ -463,10 +481,12 @@ def cmd_fetch(args) -> int:
     core.require_gh()
     require_auth()
     repo = core.need_repo()
-    return _fetch(args.target, repo, args.out, bool(args.force), bool(args.yes))
+    return _fetch(args.target, repo, args.out, bool(args.force), bool(args.yes),
+                  bool(args.cleanup))
 
 
-def _fetch(target: str, repo: str, out: Optional[str], force: bool, authorized: bool) -> int:
+def _fetch(target: str, repo: str, out: Optional[str], force: bool, authorized: bool,
+           cleanup: bool = False) -> int:
     task = core.resolve_task_id(target, out)
     rid = core.resolve_run_id(target, out)
     rdir = core.run_dir(task, out)
@@ -576,6 +596,7 @@ def _fetch(target: str, repo: str, out: Optional[str], force: bool, authorized: 
     ui.note("状态复用: " + state.describe_state(manifest).split(": ", 1)[-1])
     ui.note("agent 后续用法：Read manifest.json 看 exit_code / outputs / runner_env / state，")
     ui.note("              再 Read output/ 下的具体产物。字段说明见 references/result-contract.md")
+    _maybe_cleanup_after_fetch(repo, rid, rdir, cleanup, authorized)
     return EXIT_OK
 
 
@@ -613,3 +634,142 @@ def cmd_list(args) -> int:
                f"{str(r.get('displayTitle') or ''):<22}"
                f"{r.get('url') or ''}")
     return EXIT_OK
+
+
+# ------------------------------------------------------------------ clean
+
+# gh run list 的 --limit：gh 会在内部翻页一直取到这个数（默认 20，这里一次全清）
+_CLEAN_ALL_RUN_LIMIT = 1000
+
+
+def cmd_clean(args) -> int:
+    core.require_gh()
+    require_auth()
+    repo = core.need_repo()
+
+    if bool(getattr(args, "all", False)) == bool(getattr(args, "run_id", None)):
+        raise GhaError("gha clean 必须二选一：--run-id <id>（task_id/run_id 均可）或 --all")
+
+    if getattr(args, "all", False):
+        runs = remote.list_runs(repo, _CLEAN_ALL_RUN_LIMIT)
+        if not runs:
+            ui.st_skip("仓库里没有可清理的 run")
+            return EXIT_OK
+        plan = _build_clean_plan(repo, runs)
+        show_cmd = "./gha clean --all --yes"
+    else:
+        rid = core.resolve_run_id(args.run_id, args.out)
+        data = remote.run_view(repo, rid)
+        if not data:
+            raise GhaError(f"run {rid} 不存在或无权访问：{repo}")
+        plan = _build_clean_plan(repo, [data])
+        show_cmd = f"./gha clean --run-id {rid} --yes"
+
+    # B 类闸门：无 --yes 只打印将执行的删除清单，绝不删
+    _print_clean_plan(repo, plan)
+    if not bool(getattr(args, "yes", False)):
+        ui.st_install("B 类操作未执行（缺 --yes）")
+        ui.note(f"命令: {show_cmd}")
+        raise NotAuthorized("需要 --yes 才能删除 run/artifact")
+
+    total_runs = len(plan)
+    total_arts = sum(len(p["artifacts"]) for p in plan)
+    art_failed = run_failed = 0
+    for p in plan:
+        af, rf = _delete_run_contents(
+            repo, p["run_id"], artifacts=p["artifacts"], title=p.get("title", ""))
+        art_failed += af
+        run_failed += rf
+
+    if art_failed or run_failed:
+        ui.err(f"清理完成但有失败：run {total_runs - run_failed}/{total_runs}、"
+               f"artifact {total_arts - art_failed}/{total_arts} —— "
+               f"失败项已逐一警告，未中断其余删除")
+        return EXIT_FAIL
+    ui.st_ok(f"清理完成：删了 {total_runs} 个 run、{total_arts} 个 artifact")
+    return EXIT_OK
+
+
+def _build_clean_plan(repo: str, runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """把 run 列表扩成删除计划：每个 run 带它的全部 artifact（按 id 删）。"""
+    plan = []
+    for r in runs:
+        rid = str(r.get("databaseId") or "")
+        if not rid:
+            continue
+        artifacts = [a for a in remote.list_run_artifacts(repo, rid) if a.get("id") is not None]
+        plan.append({
+            "run_id": rid,
+            "title": str(r.get("displayTitle") or ""),
+            "url": str(r.get("url") or ""),
+            "artifacts": artifacts,
+        })
+    return plan
+
+
+def _print_clean_plan(repo: str, plan: List[Dict[str, Any]]) -> None:
+    total_arts = sum(len(p["artifacts"]) for p in plan)
+    ui.info(f"删除计划（{repo}）：{len(plan)} 个 run、{total_arts} 个 artifact")
+    for p in plan:
+        if p["artifacts"]:
+            names = "、".join(
+                f"{a.get('name') or a.get('id')}#{a.get('id')}" for a in p["artifacts"])
+            ui.log(f"  run {p['run_id']}（{p['title']}）: artifact {names}")
+        else:
+            ui.log(f"  run {p['run_id']}（{p['title']}）: 无 artifact（删 run 即连带日志）")
+
+
+def _delete_run_contents(repo: str, run_id: str, artifacts: Optional[List[Dict[str, Any]]] = None,
+                         title: str = "") -> Tuple[int, int]:
+    """删 run 的全部 artifact，再删 run 本身。返回 (artifact 失败数, run 失败数)。
+
+    一个失败只警告、不中断其余删除；fetch 后的自动清理也走这里。
+    artifacts 不传时现查（fetch 自动清理路径没有提前建计划）。
+    """
+    art_failed = 0
+    if artifacts is None:
+        artifacts = remote.list_run_artifacts(repo, run_id)
+    for a in artifacts:
+        if a.get("id") is None:
+            continue
+        aid = int(a.get("id"))
+        name = str(a.get("name") or f"#{aid}")
+        if remote.delete_artifact(repo, aid):
+            ui.st_ok(f"已删 artifact {name}#{aid}")
+        else:
+            ui.warn(f"删除 artifact {name}#{aid} 失败")
+            art_failed += 1
+    suffix = f"（{title}）" if title else ""
+    if remote.delete_run(repo, run_id):
+        ui.st_ok(f"已删 run {run_id}{suffix}")
+        return art_failed, 0
+    ui.warn(f"删除 run {run_id}{suffix} 失败")
+    return art_failed, 1
+
+
+def _maybe_cleanup_after_fetch(repo: str, rid: str, rdir: Path,
+                               cleanup: bool, authorized: bool) -> None:
+    """fetch 成功后按请求清理 run + artifact（B 类）。
+
+    调用方只在取回成功（manifest 就位、返回 EXIT_OK）时才会走到这里；
+    取回失败直接提前返回，run 与 artifact 都保留供排查。
+
+    cleanup 是本次命令带的 --cleanup；登记是 submit --cleanup --yes（非 --wait）
+    落盘的 <rdir>/cleanup 标记 —— 那次提交已取得用户同意，fetch 时不必再要 --yes。
+    """
+    marked = core.read_text_file(rdir / "cleanup").strip() == "1"
+    if not cleanup and not marked:
+        return
+    if cleanup and not marked and not authorized:
+        ui.st_install("未清理 run/artifact（--cleanup 是 B 类写操作，需要与 --yes 一起用）")
+        ui.note(f"命令: ./gha clean --run-id {rid} --yes（不删也行，run 记录会留下）")
+        return
+    if marked:
+        ui.note("按提交时登记的 --cleanup，取回成功后清理该 run 与 artifact")
+    _delete_run_contents(repo, rid)
+    if marked:
+        # 已执行完登记里的清理，摘掉标记，避免下次 fetch --force 再撞一遍
+        try:
+            (rdir / "cleanup").unlink()
+        except OSError:
+            pass

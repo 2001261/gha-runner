@@ -41,6 +41,7 @@
 | Headless 浏览器自动化 | Playwright 驱动 Chromium 逛 Hacker News：解析榜单 → 逐条点进评论区 → 生成摘要（`tasks/hn-browse/`） |
 | 失败任务结果不丢 | 任务 `exit 3`，artifact 照样上传，失败前产出的部分结果完整保留 |
 | 超时智能诊断 | 撞时间上限 ≠ 任务失败：三信号组合识别（GitHub 对超时的 conclusion 是 `cancelled` 而不是 `timed_out`，这是实测踩出来的） |
+| 取回即清（仓库清理） | 结果消费完就用 `gha clean` 删 artifact + run；或 `submit`/`fetch` 直接带 `--cleanup --yes`，取回成功即自动清理（取回失败保留现场证据） |
 
 端到端固定开销约 **25 秒**（内联投递）——比直觉的"上云要等一两分钟"低得多。
 
@@ -90,7 +91,7 @@ echo "进度" > "$GHA_STATE_DIR/progress.txt"          # 跨 run 状态（配 --
 
 CLI 本体是 Python（≥3.9，纯标准库），通过两个启动器进入：`./gha`（macOS/Linux）、
 `gha.cmd`（Windows）。跨平台行为不是"设计上支持"，是在托管 runner 上**实测**的：
-把 `gha_runner/` + `tests/` 打成任务包投到三个平台的 runner 上跑 69 项单元测试，
+把 `gha_runner/` + `tests/` 打成任务包投到三个平台的 runner 上跑 75 项单元测试，
 全绿。Windows 特有的坑（tar 盘符、没有 `python3`、cp1252 控制台）都已修复并记录在
 `references/limits.md` 第 8 节。
 
@@ -142,13 +143,13 @@ CLI 本体是 Python（≥3.9，纯标准库），通过两个启动器进入：
 ├── tasks/                  示例任务（smoke / cachetest / repo-insight /
 │                           resume-demo / browser-test / hn-browse）
 ├── assets/                 README 用的图片（公众号二维码）
-└── tests/                  69 项单元测试
+└── tests/                  75 项单元测试
 ```
 
 ## 开发与测试
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 69 项单元测试
+python3 -m unittest discover -s tests -t .   # 75 项单元测试
 
 # 用本工具测本工具：把测试投到三个平台的 runner 上跑（真·自举）
 ./gha submit <打包的测试目录> --runner windows-latest --wait --yes

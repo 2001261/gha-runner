@@ -1,7 +1,7 @@
 ---
 name: gha-runner
 slug: gha-runner
-version: 1.0.1
+version: 1.1.0
 displayName: GHA Runner · 云端任务 Worker
 homepage: https://github.com/2001261/gha-runner
 tags: [GitHub Actions, 云端执行, CI, 任务卸载, 并行跑批, agent]
@@ -16,7 +16,8 @@ description: >-
   需要运行证据可回溯（run log + artifact）；需要定时或事件触发；希望不占 agent 回合、
   提交后立即去做别的事。关键词：GitHub Actions、云端跑任务、把任务丢到云上、卸载计算、
   offload、长耗时任务、并行跑批、matrix 并行、CI、跑不动了换云端、干净 Linux 环境、
-  跨平台测试、4 核 16G、留运行证据、撞墙续跑、状态复用、云沙盒、gha-runner。
+  跨平台测试、4 核 16G、留运行证据、撞墙续跑、状态复用、仓库清理、清理 run、
+  删除 artifact、云沙盒、gha-runner。
   不要触发的情况（留在本地）：一两分钟内能完成的轻量任务（固定开销约 25 秒不划算）；
   需要交互式 stdin；依赖本地文件系统、localhost 或内网资源；需要 GPU、GUI 或
   超过 16GB 内存；延迟敏感、要秒级反馈的迭代。用户问"这任务该本地跑还是上云"时也使用。
@@ -80,6 +81,21 @@ CLI 入口（Python ≥ 3.9、纯标准库实现，三平台兼容）：
 
 **绝不得**：代用户跑 `gh auth login`（会卡死在交互提示）；读取、回显、记录 token 值；
 把 token 写进任何文件或日志；未经用户明确要求就用 `--allow-public` 绕过凭据扫描。
+
+## 清理策略（结果取回后，及时清掉远端现场）
+
+run 记录与日志会**一直留在仓库 Actions 页**（artifact 虽默认 90 天过期，但 run 不删不消失），
+临时任务跑完不清理会越积越多。何时能直接删、何时必须先问，规则如下：
+
+| 情形 | agent 动作 |
+|---|---|
+| **临时任务**（一次性分析/验证/抓取/测试，结果取回即被消费） | 取回成功后**立即** `./gha clean --run-id <id> --yes`（先删全部 artifact 再删 run）；或 submit 时直接带 `--cleanup --yes`，取回成功即自动清理 |
+| **需长期留存**（归档、审计、发布物、需要回溯的运行证据、用户明确要留的） | **运行时询问用户**保留还是清理，**不得擅自删** |
+| **拿不准**临时还是长期 | 问用户，不猜 |
+
+`clean` 与 `--cleanup` 都是 B 类写操作：不带 `--yes` 时只打印将执行的删除清单并返回 125。
+判定参考：GitHub artifact 默认 **90 天**过期，但 **run 记录和日志不过期** —— 删了无法恢复，
+拿不准时宁可留下 run 记录（不占分钟数），也不要删用户可能还要回溯的证据。
 
 ## 工作流
 
@@ -286,7 +302,8 @@ artifact 仍然上传，`exit_code=3`，**失败前已产出的部分结果完�
 | `gha submit <dir> [选项] [--yes]` | B | 打包 + 扫描 + 投递 |
 | `gha status <task\|run>` | A | 一次性查询，输出 JSON |
 | `gha wait <task\|run> [--timeout S] [--interval S]` | A | 阻塞等待；超时退出码 2 |
-| `gha fetch <task\|run> [--out DIR] [--force] [--yes]` | A/B | 下载 artifact；`--yes` 才清远端分支 |
+| `gha fetch <task\|run> [--out DIR] [--force] [--cleanup] [--yes]` | A/B | 下载 artifact；`--yes` 才清远端分支；`--cleanup --yes` 取回成功后自动删 run+artifact |
+| `gha clean --run-id <id>\|--all [--yes]` | B | 删 run 及其 artifact（先删 artifact 再删 run）；`--all` 逐条列出后全清 |
 | `gha logs <task\|run> [--failed]` | A | 取 run 日志 |
 | `gha list [--limit N]` | A | 列本仓库的 run |
 
@@ -305,7 +322,7 @@ templates/agent-dispatch.yml    常驻默认分支的通用 dispatcher
 gha                             CLI 启动器（POSIX sh，macOS/Linux）
 gha.cmd                         CLI 启动器（Windows cmd，必须 CRLF 行尾）
 gha_runner/                     CLI 本体（Python ≥ 3.9，纯标准库）
-tests/                          单元测试（unittest，69 项）
+tests/                          单元测试（unittest，75 项）
 bin/                            空白环境下 setup 下载的 gh 兜底副本（已 gitignore）
 config/{repo,visibility}        init 写入的运行时配置（已 gitignore）
 tasks/smoke/                    自检用示例任务
@@ -333,6 +350,6 @@ tasks/hn-browse/                真实多步浏览任务（Playwright 逛 HN）
 - **所有路径双引号包裹**（开发目录路径本身就含空格）
 - 退出码是对外契约：`0/1/2/3/4/125`，改语义前先看 `gha_runner/ui.py` 的注释
 - `references/result-contract.md` 第八节列了 dispatcher 模板的 11 条实现要点，全是实测踩出来的
-- 回归手段：`python3 -m unittest discover -s tests -t .`（69 项）；三平台真实验证靠
+- 回归手段：`python3 -m unittest discover -s tests -t .`（75 项）；三平台真实验证靠
   把 `gha_runner/` + `tests/` 打成任务包 `./gha submit --runner windows-latest` 投到
   scratch 仓库跑（本仓库软件项目的 CI，ToS 干净）

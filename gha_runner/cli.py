@@ -18,7 +18,7 @@ PROG = "gha"
 EPILOG = """\
 授权边界（重要）:
   A 只读检测      — gha 自主执行（doctor / status / list / logs / wait / fetch）
-  B 写操作        — 装 gh、建仓、git push、dispatch、删分支；需 --yes。
+  B 写操作        — 装 gh、建仓、git push、dispatch、删分支/删 run/artifact（clean）；需 --yes。
                     不带 --yes 时只打印将执行的命令并退出 125，绝不执行。
                     agent 每次都要先取得用户同意，一次同意只覆盖那一次那一个动作。
   C 必须真人操作  — gh auth login / auth refresh / SSO / 网页开关；
@@ -85,6 +85,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="跳过凭据/隐私扫描（责任自负，需用户明确要求）")
     sb.add_argument("--cache-key", help="启用跨次环境复用；不给则完全关闭缓存")
     sb.add_argument("--cache-paths", help="额外要缓存的路径，逗号或换行分隔")
+    sb.add_argument("--cleanup", action="store_true",
+                    help="取回成功后自动清理该 run + artifact（B 类，需与 --yes 一起用；"
+                         "非 --wait 时登记到 fetch 时生效）")
     sb.add_argument("--yes", action="store_true", help="允许 B 类写操作（push、dispatch）")
     sb.set_defaults(func=commands.cmd_submit)
 
@@ -109,8 +112,20 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("target", help="task_id 或 run_id")
     f.add_argument("--out")
     f.add_argument("--force", action="store_true", help="忽略幂等缓存，强制重下")
+    f.add_argument("--cleanup", action="store_true",
+                   help="取回成功后自动清理该 run + artifact（B 类，需与 --yes 一起用）")
     f.add_argument("--yes", action="store_true", help="允许清理分支投递留下的远端分支（B 类）")
     f.set_defaults(func=commands.cmd_fetch)
+
+    # --- clean
+    c = sub.add_parser("clean", help="删 run 及其 artifact（B 类，需 --yes）",
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    c.add_argument("--run-id", help="task_id 或 run_id：先删该 run 的全部 artifact，再删 run 本身")
+    c.add_argument("--all", action="store_true",
+                   help="删仓库里全部 workflow run 及其 artifact（逐条列出再删）")
+    c.add_argument("--out")
+    c.add_argument("--yes", action="store_true", help="允许删除（B 类）")
+    c.set_defaults(func=commands.cmd_clean)
 
     # --- logs
     lg = sub.add_parser("logs", help="取 run 日志")

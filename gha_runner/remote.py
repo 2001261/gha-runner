@@ -344,6 +344,29 @@ def delete_branch(repo: str, branch: str) -> bool:
     return res.ok
 
 
+# ------------------------------------------------------------------ 清理（run / artifact）
+
+def list_run_artifacts(repo: str, run_id: str) -> List[Dict[str, Any]]:
+    """列 run 的全部 artifact（每个含 id/name/size_in_bytes 等）。查不到返回 []。"""
+    data = core.gh_json(["api", f"repos/{repo}/actions/runs/{run_id}/artifacts"])
+    if not isinstance(data, dict):
+        return []
+    arts = data.get("artifacts")
+    return arts if isinstance(arts, list) else []
+
+
+def delete_run(repo: str, run_id: str) -> bool:
+    """删 run（连带 run 日志）。删成功返回 True。"""
+    res = core.run_gh(["api", "-X", "DELETE", f"repos/{repo}/actions/runs/{run_id}"])
+    return res.ok
+
+
+def delete_artifact(repo: str, artifact_id: int) -> bool:
+    res = core.run_gh(["api", "-X", "DELETE",
+                       f"repos/{repo}/actions/artifacts/{artifact_id}"])
+    return res.ok
+
+
 def workflow_present(repo: str) -> bool:
     return core.run_gh(["workflow", "view", core.WORKFLOW_NAME], repo=repo).ok
 
